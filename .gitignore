@@ -1,0 +1,14 @@
+# Ghostscan outputs
+*/nmap/
+*/web/
+*/smb/
+*/ftp/
+*/dns/
+*/mail/
+*/db/
+*/report/
+
+# Temp files
+*.tmp
+*.log
+*.gnmap
