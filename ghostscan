@@ -1,0 +1,200 @@
+#!/bin/bash
+
+# ====== COLORES ======
+green="\e[0;32m\033[1m"; red="\e[0;31m\033[1m"
+blue="\e[0;34m\033[1m"; yellow="\e[0;33m\033[1m"
+end="\033[0m\e[0m"
+
+# ====== UI ======
+banner(){ echo -e "${blue}\n   ┌───────────┐\n   │   GHOST   │\n   └───────────┘${end}\n"; }
+log(){ echo -e "${blue}[*]${end} $1"; }
+ok(){ echo -e "${green}[+]${end} $1"; }
+warn(){ echo -e "${yellow}[!]${end} $1"; }
+err(){ echo -e "${red}[-]${end} $1"; }
+
+# ====== CTRL+C ======
+trap 'echo -e "\n${red}[!] Saliendo...${end}"; exit 0' INT
+
+# ====== ARGS ======
+AUTO=0; VERBOSE=0; IP=""
+for arg in "$@"; do
+  case $arg in
+    -h|--help)
+      banner
+      echo "Uso: ghostscan <IP> [-a|--auto] [-v|--verbose]"
+      exit 0;;
+    -a|--auto) AUTO=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    *) IP="$arg" ;;
+  esac
+done
+[[ -z "$IP" ]] && { err "Debes indicar una IP"; exit 1; }
+
+banner
+log "Objetivo: $IP"
+
+# ====== PRECHECK ======
+log "Ping..."
+if ! ping -c 1 "$IP" &>/dev/null; then err "Host no alcanzable"; exit 1; fi
+ok "Host activo"
+
+# ====== WORKDIR ======
+OUT="$IP"; mkdir -p "$OUT"/{nmap,web,smb,ftp,mail,dns,db,report}
+ok "Directorio: $OUT/"
+
+# ====== PUERTOS ======
+log "Escaneando puertos (-p-)..."
+nmap -p- --open -T4 -n -Pn "$IP" -oG "$OUT/nmap/ports.gnmap" >/dev/null
+
+open_ports=$(grep "/open/" "$OUT/nmap/ports.gnmap" \
+  | awk '{for(i=1;i<=NF;i++) if($i ~ /\/open\//) print $i}' \
+  | cut -d '/' -f1)
+
+[[ -z "$open_ports" ]] && { err "Sin puertos abiertos"; exit 1; }
+echo "$open_ports" | tr ' ' '\n' > "$OUT/nmap/openPorts"
+ok "Puertos:"
+cat "$OUT/nmap/openPorts"
+
+# ====== SERVICIOS ======
+PORTS_CSV=$(paste -sd, "$OUT/nmap/openPorts")
+log "Detección de servicios (-sV -sC)..."
+nmap -sV -sC -p "$PORTS_CSV" "$IP" -oN "$OUT/nmap/services.txt" >/dev/null
+ok "Guardado: nmap/services.txt"
+
+# ====== EXTRACTORES ======
+extract_users(){
+  # Heurístico simple: palabras tipo usuario en outputs
+  grep -Eo 'user(name)?[:= ]+[a-zA-Z0-9._-]+' -h "$OUT"/**/* 2>/dev/null \
+  | awk -F'[:= ]+' '{print $2}' | sort -u > "$OUT/report/users.txt"
+}
+
+extract_creds(){
+  # Busca patrones básicos user:pass o password=...
+  grep -Eo '[a-zA-Z0-9._-]+:[^[:space:]]+' -h "$OUT"/**/* 2>/dev/null \
+  | sort -u > "$OUT/report/creds.txt"
+  grep -Eoi 'password[:= ][^[:space:]]+' -h "$OUT"/**/* 2>/dev/null \
+  | sort -u >> "$OUT/report/creds.txt"
+}
+
+# ====== ENUM MÓDULOS ======
+enum_http(){
+  local port=$1 proto=$2 url="$proto://$IP:$port"
+  log "[$port/$proto] whatweb"
+  whatweb "$url" &> "$OUT/web/whatweb_$port.txt" 2>/dev/null
+
+  if command -v gobuster &>/dev/null; then
+    log "[$port/$proto] gobuster (common)"
+    gobuster dir -u "$url" -w /usr/share/wordlists/dirb/common.txt \
+      -q -t 30 -o "$OUT/web/gobuster_$port.txt"
+  else warn "gobuster no instalado"; fi
+
+  ok "Web → $OUT/web/"
+}
+
+enum_smb(){
+  if command -v enum4linux &>/dev/null; then
+    log "[SMB] enum4linux -a"
+    enum4linux -a "$IP" &> "$OUT/smb/enum4linux.txt"
+  else warn "enum4linux no instalado"; fi
+
+  log "[SMB] smbclient -L"
+  smbclient -L "//$IP" -N &> "$OUT/smb/shares.txt"
+
+  ok "SMB → $OUT/smb/"
+}
+
+enum_ftp(){
+  log "[FTP] prueba anónima"
+  (echo "quit" | ftp -inv "$IP") &> "$OUT/ftp/ftp.txt"
+  ok "FTP → $OUT/ftp/"
+}
+
+enum_dns(){
+  log "[DNS] axfr"
+  dig axfr @"$IP" &> "$OUT/dns/axfr.txt"
+  ok "DNS → $OUT/dns/"
+}
+
+enum_mail(){
+  log "[MAIL] banner"
+  (echo "QUIT" | nc "$IP" 25) &> "$OUT/mail/smtp.txt"
+  ok "MAIL → $OUT/mail/"
+}
+
+enum_db(){
+  log "[DB] mysql banner"
+  (echo "quit" | nc "$IP" 3306) &> "$OUT/db/mysql.txt"
+  ok "DB → $OUT/db/"
+}
+
+# ====== AUTO-RECON ======
+auto(){
+  log "AUTO-RECON iniciado"
+
+  while read p; do
+    case $p in
+      80)   enum_http 80 http ;;
+      443)  enum_http 443 https ;;
+      8080) enum_http 8080 http ;;
+      445|139) enum_smb ;;
+      21)   enum_ftp ;;
+      53)   enum_dns ;;
+      25|110|143) enum_mail ;;
+      3306) enum_db ;;
+      22)   log "[SSH] Consejo: prueba usuarios/credenciales encontradas" ;;
+      *)    log "[$p] sin módulo específico" ;;
+    esac
+  done < "$OUT/nmap/openPorts"
+
+  ok "AUTO-RECON completado"
+}
+
+# ====== CORRELACIÓN ======
+correlate(){
+  log "Correlando artefactos (usuarios/credenciales)..."
+  extract_users
+  extract_creds
+
+  if [[ -s "$OUT/report/users.txt" ]]; then
+    ok "Usuarios candidatos:"
+    cat "$OUT/report/users.txt"
+  else warn "Sin usuarios detectados"; fi
+
+  if [[ -s "$OUT/report/creds.txt" ]]; then
+    ok "Posibles credenciales:"
+    cat "$OUT/report/creds.txt"
+  else warn "Sin credenciales claras"; fi
+}
+
+# ====== RESUMEN ======
+summary(){
+  echo -e "\n${blue}==== RESUMEN ====${end}"
+  echo "IP: $IP"
+  echo -n "Puertos: "; paste -sd, "$OUT/nmap/openPorts"; echo
+  echo "Servicios: ver $OUT/nmap/services.txt"
+
+  echo -e "\nSiguientes pasos sugeridos:"
+  while read p; do
+    case $p in
+      80|443|8080) echo " - Web ($p): revisar /, login, fuzzing de rutas" ;;
+      445|139) echo " - SMB: shares, null sessions, buscar archivos" ;;
+      22) echo " - SSH: probar usuarios/credenciales hallados" ;;
+      21) echo " - FTP: acceso anónimo y descargas" ;;
+      53) echo " - DNS: subdominios / AXFR" ;;
+      25|110|143) echo " - Mail: enumeración de usuarios" ;;
+      3306) echo " - DB: credenciales por defecto" ;;
+      *) echo " - Puerto $p: investigar servicio" ;;
+    esac
+  done < "$OUT/nmap/openPorts"
+
+  echo -e "\nArtefactos en: $OUT/"
+}
+
+# ====== RUN ======
+if [[ $AUTO -eq 1 ]]; then
+  auto
+  correlate
+  summary
+else
+  warn "Usa -a para modo automático"
+fi
