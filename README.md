@@ -1,5 +1,10 @@
 # 👻 Ghostscan
 
+![Bash](https://img.shields.io/badge/language-bash-blue)
+![Status](https://img.shields.io/badge/status-active-success)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-linux-lightgrey)
+
 > Interactive Auto-Reconnaissance Tool for Pentesting Beginners
 
 Ghostscan is a Bash-based tool designed to help beginners perform structured reconnaissance during penetration testing.  
